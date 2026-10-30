@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+holdings.json
+estimates_log.csv
+.DS_Store
+*.bak
