@@ -6,6 +6,8 @@ dir = fso.GetParentFolderName(WScript.ScriptFullName)
 script = dir & "\hstech_float.py"
 
 candidates = Array( _
+  sh.ExpandEnvironmentStrings("%LocalAppData%") & "\Programs\Python\Python312\pythonw.exe", _
+  sh.ExpandEnvironmentStrings("%LocalAppData%") & "\Python\pythoncore-3.12-64\pythonw.exe", _
   sh.ExpandEnvironmentStrings("%LocalAppData%") & "\Python\pythoncore-3.14-64\pythonw.exe", _
   sh.ExpandEnvironmentStrings("%LocalAppData%") & "\Programs\Python\Python314\pythonw.exe", _
   sh.ExpandEnvironmentStrings("%LocalAppData%") & "\Microsoft\WindowsApps\pythonw.exe" _
@@ -27,7 +29,7 @@ If pyw = "" Then
   On Error GoTo 0
 End If
 If pyw = "" Then
-  MsgBox "??? pythonw.exe??????? Python?", vbExclamation, "????"
+  MsgBox "找不到 pythonw.exe，请先安装 Python。", vbExclamation, "盯盘浮窗"
   WScript.Quit 1
 End If
 cmd = """" & pyw & """ """ & script & """"

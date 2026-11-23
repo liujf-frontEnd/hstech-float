@@ -9,10 +9,14 @@ from __future__ import annotations
 import csv
 import json
 import re
+import shutil
 import ssl
+import subprocess
+import sys
 import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, time as dtime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -234,13 +238,62 @@ def is_market_open(dt: Optional[datetime] = None) -> bool:
     return is_hk_session(dt) or is_cn_session(dt)
 
 
+_CREATE_NO_WINDOW = 0x08000000  # 避免 pythonw 调 curl 时闪出黑窗
+
+
 def _http_get(url: str, *, encoding: str = "utf-8", extra_headers: Optional[dict] = None) -> str:
     headers = {"User-Agent": UA, "Accept": "*/*"}
     if extra_headers:
         headers.update(extra_headers)
+    last_err: Optional[BaseException] = None
+    for attempt in range(2):
+        try:
+            return _http_get_urllib(url, encoding=encoding, headers=headers)
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                time.sleep(0.15)
+    # Windows 常见本地代理（Clash 等 Fake-IP / TUN）会对连接做 TLS 重协商。
+    # Python urllib 走 OpenSSL，经常被对端直接断开；系统 curl.exe 走 Schannel，通常可通。
+    try:
+        return _http_get_curl(url, encoding=encoding, headers=headers)
+    except Exception:
+        if last_err is not None:
+            raise last_err
+        raise
+
+
+def _http_get_urllib(url: str, *, encoding: str, headers: dict) -> str:
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=10, context=SSL_CTX) as resp:
         return resp.read().decode(encoding, errors="replace")
+
+
+def _http_get_curl(url: str, *, encoding: str, headers: dict) -> str:
+    curl = shutil.which("curl.exe") or shutil.which("curl")
+    if not curl:
+        raise FileNotFoundError("curl not found")
+    cmd = [curl, "-sS", "-L", "--max-time", "10", "--connect-timeout", "8"]
+    for k, v in headers.items():
+        lk = k.lower()
+        if lk == "user-agent":
+            cmd.extend(["-A", str(v)])
+        elif lk == "referer":
+            cmd.extend(["-e", str(v)])
+        else:
+            cmd.extend(["-H", f"{k}: {v}"])
+    cmd.append(url)
+    kwargs: dict = {"capture_output": True, "timeout": 12}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", _CREATE_NO_WINDOW)
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        kwargs["startupinfo"] = si
+    p = subprocess.run(cmd, **kwargs)
+    if p.returncode != 0:
+        err = (p.stderr or b"").decode("utf-8", errors="replace").strip()[:240]
+        raise OSError(f"curl exit {p.returncode}: {err or 'no stderr'}")
+    return (p.stdout or b"").decode(encoding, errors="replace")
 
 
 def _sina_batch(codes: List[str]) -> Dict[str, List[str]]:
@@ -768,6 +821,263 @@ def holdings_to_sina_codes(holdings: List[Holding]) -> List[str]:
     return codes
 
 
+# ---------- 当日分时（东财 trends2）----------
+def _em_secid(market: str, code: str) -> Optional[str]:
+    m = (market or "").strip().lower()
+    c = (code or "").strip()
+    if not c:
+        return None
+    if m == "hk" or c.upper() == "HSTECH":
+        if c.upper() == "HSTECH":
+            return "124.HSTECH"
+        digits = re.sub(r"\D", "", c).zfill(5)
+        return f"116.{digits}"
+    if m in ("sh", "sz"):
+        digits = re.sub(r"\D", "", c).zfill(6)[-6:]
+        return ("1." if m == "sh" else "0.") + digits
+    return None
+
+
+def _secid_from_sina_key(key: str) -> Optional[str]:
+    k = (key or "").strip()
+    if not k:
+        return None
+    if "HSTECH" in k.upper():
+        return "124.HSTECH"
+    if k.startswith("rt_hk"):
+        return _em_secid("hk", k[5:])
+    if k.startswith("s_sh"):
+        return _em_secid("sh", k[4:])
+    if k.startswith("s_sz"):
+        return _em_secid("sz", k[4:])
+    if k.startswith("sh"):
+        return _em_secid("sh", k[2:])
+    if k.startswith("sz"):
+        return _em_secid("sz", k[2:])
+    return None
+
+
+def _iter_session_minutes(start: dtime, end: dtime) -> List[str]:
+    t = datetime(2000, 1, 1, start.hour, start.minute)
+    last = datetime(2000, 1, 1, end.hour, end.minute)
+    out: List[str] = []
+    while t <= last:
+        out.append(t.strftime("%H:%M"))
+        t += timedelta(minutes=1)
+    return out
+
+
+SESSION_AXES: Dict[str, List[str]] = {
+    "cn": _iter_session_minutes(dtime(9, 30), dtime(11, 30))
+    + _iter_session_minutes(dtime(13, 0), dtime(15, 0)),
+    "hk": _iter_session_minutes(dtime(9, 30), dtime(12, 0))
+    + _iter_session_minutes(dtime(13, 0), dtime(16, 0)),
+    "mix": _iter_session_minutes(dtime(9, 30), dtime(12, 0))
+    + _iter_session_minutes(dtime(13, 0), dtime(16, 0)),
+}
+
+
+_trend_cache: Dict[str, Tuple[float, Optional[dict]]] = {}
+_trend_cache_lock = threading.Lock()
+_TREND_TTL = 20.0
+
+
+def _invalidate_trend_cache() -> None:
+    with _trend_cache_lock:
+        _trend_cache.clear()
+
+
+def _curve_cap_hm(trends: Dict[str, dict]) -> str:
+    """曲线只画到「现在」与最新分时之间的较早者，避免盘中把线拉平到收盘。"""
+    cap = now_shanghai().strftime("%H:%M")
+    last = None
+    for tr in (trends or {}).values():
+        pts = (tr or {}).get("points") or []
+        if pts:
+            hm = pts[-1][0]
+            if last is None or hm > last:
+                last = hm
+    if last:
+        cap = min(cap, last)
+    return cap
+
+
+def _clip_curve(
+    points: List[Tuple[str, Optional[float]]], cap_hm: str
+) -> List[Tuple[str, Optional[float]]]:
+    return [(t, v if t <= cap_hm else None) for t, v in points]
+
+
+def fetch_minute_trend(secid: str) -> Optional[dict]:
+    """东财分时。返回 {name, pre, points: [(HH:MM, price), ...]}。"""
+    now_ts = time.time()
+    with _trend_cache_lock:
+        hit = _trend_cache.get(secid)
+    if hit and now_ts - hit[0] < _TREND_TTL:
+        return hit[1]
+    url = (
+        "https://push2.eastmoney.com/api/qt/stock/trends2/get"
+        f"?secid={secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13"
+        "&fields2=f51,f52,f53,f54,f55,f56,f57,f58&ndays=1&iscr=0"
+    )
+    data: dict = {}
+    try:
+        text = _http_get(url, extra_headers={"Referer": "https://quote.eastmoney.com/"})
+        data = (json.loads(text) or {}).get("data") or {}
+    except Exception:
+        data = {}
+    if not data:
+        with _trend_cache_lock:
+            _trend_cache[secid] = (now_ts, None)
+        return None
+    try:
+        pre = float(data.get("preClose") or data.get("prePrice") or 0)
+    except Exception:
+        pre = 0.0
+    today = _trade_date_str()
+    points: List[Tuple[str, float]] = []
+    for raw in data.get("trends") or []:
+        try:
+            head, *rest = str(raw).split(",")
+            parts = head.strip().split(" ", 1)
+            if len(parts) != 2:
+                continue
+            day, hm = parts
+            if day != today:
+                continue
+            hm = hm[:5]
+            price = float(rest[1])  # 该分钟收
+            if price <= 0:
+                continue
+            points.append((hm, price))
+        except Exception:
+            continue
+    out = {
+        "secid": secid,
+        "name": str(data.get("name") or ""),
+        "pre": pre,
+        "points": points,
+    }
+    with _trend_cache_lock:
+        _trend_cache[secid] = (now_ts, out)
+    return out
+
+
+def fetch_minute_trends(secids: List[str]) -> Dict[str, dict]:
+    uniq: List[str] = []
+    seen = set()
+    for s in secids:
+        if s and s not in seen:
+            seen.add(s)
+            uniq.append(s)
+    out: Dict[str, dict] = {}
+    if not uniq:
+        return out
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {ex.submit(fetch_minute_trend, s): s for s in uniq}
+        for fut in as_completed(futs):
+            s = futs[fut]
+            try:
+                tr = fut.result()
+            except Exception:
+                tr = None
+            if tr:
+                out[s] = tr
+    return out
+
+
+def _pct_points(trend: dict) -> List[Tuple[str, float]]:
+    try:
+        pre = float(trend.get("pre") or 0)
+    except Exception:
+        pre = 0.0
+    if pre <= 0:
+        return []
+    return [(hm, (px / pre - 1.0) * 100.0) for hm, px in (trend.get("points") or [])]
+
+
+def _lookup_last(series: List[Tuple[str, float]], hm: str) -> Optional[float]:
+    last: Optional[float] = None
+    for t, v in series:
+        if t <= hm:
+            last = v
+        else:
+            break
+    return last
+
+
+def _align_pct(trend: dict, axis: List[str]) -> List[Tuple[str, Optional[float]]]:
+    pts = _pct_points(trend)
+    return [(hm, _lookup_last(pts, hm)) for hm in axis]
+
+
+def _fund_curve(
+    holdings: List[Holding],
+    trends: Dict[str, dict],
+    axis: List[str],
+) -> List[Tuple[str, Optional[float]]]:
+    series: List[List[Tuple[str, float]]] = []
+    weights: List[float] = []
+    for market, code, _n, w in holdings:
+        try:
+            wf = float(w)
+        except Exception:
+            continue
+        if wf <= 0:
+            continue
+        sid = _em_secid(market, code)
+        if not sid:
+            continue
+        tr = trends.get(sid)
+        if not tr:
+            continue
+        pts = _pct_points(tr)
+        if not pts:
+            continue
+        series.append(pts)
+        weights.append(wf)
+    out: List[Tuple[str, Optional[float]]] = []
+    for hm in axis:
+        est = 0.0
+        used = 0
+        for pts, w in zip(series, weights):
+            pct = _lookup_last(pts, hm)
+            if pct is None:
+                continue
+            est += w * pct / 100.0
+            used += 1
+        out.append((hm, est if used else None))
+    return out
+
+
+def _total_pnl_curve(
+    items: List[dict],
+    fund_curves: Dict[str, List[Tuple[str, Optional[float]]]],
+    stock_curves: Dict[str, List[Tuple[str, Optional[float]]]],
+    axis: List[str],
+) -> List[Tuple[str, Optional[float]]]:
+    out: List[Tuple[str, Optional[float]]] = []
+    for i, hm in enumerate(axis):
+        total = 0.0
+        used = 0
+        for it in items:
+            try:
+                amt = float(it.get("amount") or 0)
+            except Exception:
+                amt = 0.0
+            if amt == 0:
+                continue
+            code = it.get("code") or ""
+            cur = (stock_curves if it.get("kind") == "stock" else fund_curves).get(code) or []
+            pct = cur[i][1] if i < len(cur) else None
+            if pct is None:
+                continue
+            total += amt * float(pct) / 100.0
+            used += 1
+        out.append((hm, total if used else None))
+    return out
+
+
 def estimate_fund(
     holdings: List[Holding],
     batch: Dict[str, List[str]],
@@ -1219,7 +1529,9 @@ class FloatWidget:
         self.menu = Menu(self.root, tearoff=0)
         self.menu.add_command(label="刷新", command=self._force_refresh)
         self.menu.add_command(label="看详细…", command=self._show_fund_detail)
+        self.menu.add_command(label="今日曲线…", command=self._show_today_curve)
         self.menu.add_command(label="设置持仓…", command=self._edit_amounts)
+        self._curve_win = None
         self.menu.add_command(label="估值误差…", command=self._show_est_errors)
         self.menu.add_command(label="打开日志目录", command=self._open_log_dir)
         self.menu.add_command(label="置顶切换", command=self._toggle_topmost)
@@ -2333,6 +2645,567 @@ class FloatWidget:
             os.startfile(str(EST_LOG_PATH.parent))  # type: ignore[attr-defined]
         except Exception as e:
             messagebox.showerror("打开失败", str(e), parent=self.root)
+
+    def _show_today_curve(self) -> None:
+        """右键：当日分时曲线。已打开则提到前台并刷新。"""
+        win = getattr(self, "_curve_win", None)
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    win.lift()
+                    self._curve_reload(force=True)
+                    return
+            except Exception:
+                self._curve_win = None
+        self._curve_dialog()
+
+    def _curve_dialog(self) -> None:
+        win = tk.Toplevel(self.root)
+        self._curve_win = win
+        win.withdraw()
+        win.title("今日曲线")
+        win.configure(bg=self.bg)
+        win.attributes("-topmost", True)
+        win.transient(self.root)
+        win.resizable(True, True)
+
+        tab_fr = tk.Frame(win, bg=self.bg)
+        tab_fr.pack(fill="x", padx=10, pady=(10, 2))
+        head = tk.Label(
+            win,
+            text="加载中…",
+            font=self.font,
+            fg="#cccccc",
+            bg=self.bg,
+            anchor="w",
+            justify="left",
+        )
+        head.pack(fill="x", padx=10, pady=(4, 2))
+        canvas = tk.Canvas(win, bg=self.bg, highlightthickness=0, height=260)
+        canvas.pack(fill="both", expand=True, padx=10, pady=4)
+        tip = tk.Label(
+            win,
+            text="指数/股票为官方分时；基金由持仓分时加权估值，仅供盯盘。左键悬停看数值。",
+            font=self.font,
+            fg=self.fg,
+            bg=self.bg,
+            anchor="w",
+        )
+        tip.pack(fill="x", padx=10)
+        btn_fr = tk.Frame(win, bg=self.bg)
+        btn_fr.pack(fill="x", padx=10, pady=(4, 10))
+        tk.Button(btn_fr, text="刷新", command=lambda: self._curve_reload(force=True)).pack(side="right", padx=(6, 0))
+        tk.Button(btn_fr, text="关闭", command=lambda: _on_close()).pack(side="right")
+
+        state = {
+            "tabs": [],  # list of dicts
+            "current": "",
+            "hover": None,
+            "drawn": [],  # (x, y, hm, val)
+            "job": None,
+            "loading": False,
+            "axis_kind": "mix",
+        }
+        self._curve_state = state
+        tab_btns: Dict[str, tk.Label] = {}
+
+        def _on_close() -> None:
+            job = state.get("job")
+            if job is not None:
+                try:
+                    win.after_cancel(job)
+                except Exception:
+                    pass
+            try:
+                if getattr(self, "_curve_win", None) is win:
+                    self._curve_win = None
+            except Exception:
+                pass
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+        def _paint_tabs() -> None:
+            for child in tab_fr.winfo_children():
+                child.destroy()
+            tab_btns.clear()
+            for tab in state["tabs"]:
+                key = tab["key"]
+                sel = key == state["current"]
+                lb = tk.Label(
+                    tab_fr,
+                    text=tab["title"],
+                    font=("Segoe UI", 9, "bold" if sel else "normal"),
+                    fg="#cccccc" if sel else self.fg,
+                    bg="#2a2a2a" if sel else self.bg,
+                    padx=8,
+                    pady=3,
+                    cursor="hand2",
+                )
+                lb.pack(side="left", padx=(0, 4))
+                lb.bind("<Button-1>", lambda e, k=key: _select(k))
+                tab_btns[key] = lb
+
+        def _select(key: str) -> None:
+            if key == state["current"]:
+                return
+            state["current"] = key
+            state["hover"] = None
+            _paint_tabs()
+            _draw()
+
+        def _cur_tab() -> Optional[dict]:
+            for tab in state["tabs"]:
+                if tab["key"] == state["current"]:
+                    return tab
+            return state["tabs"][0] if state["tabs"] else None
+
+        def _fmt_val(val: Optional[float], unit: str) -> str:
+            if val is None:
+                return "—"
+            if unit == "pnl":
+                return f"{val:+,.0f}"
+            return f"{val:+.2f}%"
+
+        def _stats(points: List[Tuple[str, Optional[float]]]):
+            vals = [v for _, v in points if v is not None]
+            if not vals:
+                return None, None, None
+            return vals[-1], max(vals), min(vals)
+
+        def _header_text(tab: Optional[dict], hover=None) -> str:
+            if not tab:
+                return "暂无数据"
+            last, hi, lo = _stats(tab.get("points") or [])
+            unit = tab.get("unit") or "pct"
+            if hover and hover[0] and hover[1] is not None:
+                return (
+                    f"{tab['title']}  {hover[0]}  {_fmt_val(hover[1], unit)}"
+                    f"    现 {_fmt_val(last, unit)}   高 {_fmt_val(hi, unit)}   低 {_fmt_val(lo, unit)}"
+                )
+            return (
+                f"{tab['title']}  现 {_fmt_val(last, unit)}"
+                f"   高 {_fmt_val(hi, unit)}   低 {_fmt_val(lo, unit)}"
+            )
+
+        def _y_range(vals: List[float], unit: str) -> Tuple[float, float]:
+            if not vals:
+                pad = 1.0 if unit == "pct" else 10.0
+                return -pad, pad
+            lo, hi = min(vals), max(vals)
+            # 始终包含 0 轴
+            lo = min(lo, 0.0)
+            hi = max(hi, 0.0)
+            if lo == hi == 0.0:
+                pad = 0.5 if unit == "pct" else 10.0
+                return -pad, pad
+            span = hi - lo
+            pad = span * 0.12 if span > 0 else (0.5 if unit == "pct" else 10.0)
+            return lo - pad, hi + pad
+
+        def _x_layout(axis: List[str], kind: str, x0: float, x1: float):
+            """把交易时段映射到 x；午休不占宽度，上下午直接相邻。"""
+            if kind == "cn":
+                times = [t for t in axis if t <= "11:30" or t >= "13:00"]
+            else:
+                times = [t for t in axis if t <= "12:00" or t >= "13:00"]
+            n = max(len(times), 1)
+            usable = max(x1 - x0, 1.0)
+            w = usable / n
+            pos: Dict[str, float] = {}
+            x = x0
+            for t in times:
+                pos[t] = x
+                x += w
+            return pos
+
+        def _draw() -> None:
+            canvas.delete("all")
+            state["drawn"] = []
+            tab = _cur_tab()
+            head.config(text=_header_text(tab, state.get("hover")))
+            w = max(int(canvas.winfo_width()), 1)
+            h = max(int(canvas.winfo_height()), 1)
+            if w < 40 or h < 40:
+                return
+            if not tab:
+                canvas.create_text(w / 2, h / 2, text="暂无数据", fill=self.fg, font=self.font)
+                return
+            points = list(tab.get("points") or [])
+            vals = [v for _, v in points if v is not None]
+            if not vals:
+                canvas.create_text(
+                    w / 2, h / 2, text="今日暂无分时（未开盘或暂不可用）", fill=self.fg, font=self.font
+                )
+                return
+            unit = tab.get("unit") or "pct"
+            axis = [t for t, _ in points]
+            kind = tab.get("axis") or "cn"
+            pad_l, pad_r, pad_t, pad_b = 50, 12, 10, 26
+            x0, x1 = pad_l, w - pad_r
+            y0, y1 = pad_t, h - pad_b
+            ymin, ymax = _y_range(vals, unit)
+            ypos = _x_layout(axis, kind, x0, x1)
+
+            def Y(v: float) -> float:
+                if ymax == ymin:
+                    return (y0 + y1) / 2
+                return y1 - (v - ymin) / (ymax - ymin) * (y1 - y0)
+
+            # 网格与 0 轴
+            grid_fg = "#2e2e2e"
+            zero_y = Y(0.0)
+            canvas.create_line(x0, zero_y, x1, zero_y, fill="#555555")
+            ticks = 4
+            for i in range(ticks + 1):
+                v = ymin + (ymax - ymin) * i / ticks
+                y = Y(v)
+                if abs(v) < 1e-9:
+                    continue
+                canvas.create_line(x0, y, x1, y, fill=grid_fg)
+                label = f"{v:+,.0f}" if unit == "pnl" else f"{v:+.2f}"
+                canvas.create_text(x0 - 6, y, text=label, fill=self.fg, font=("Consolas", 8), anchor="e")
+            canvas.create_text(
+                x0 - 6, zero_y, text="0", fill=self.fg_flat, font=("Consolas", 8), anchor="e"
+            )
+
+            # 时间刻度（午休已去掉，11:30/12:00 与 13:00 相邻，不再标 13:00）
+            labels = ["09:30"]
+            if kind == "cn":
+                labels += ["11:30", "15:00"]
+            else:
+                labels += ["12:00", "16:00"]
+            for lb in labels:
+                if lb in ypos:
+                    canvas.create_text(ypos[lb], y1 + 10, text=lb, fill=self.fg, font=("Consolas", 8))
+
+            # 上下午连成一段，午休不留空
+            segs = [[(t, v) for t, v in points if v is not None and t in ypos]]
+
+            def _split_zero(seg):
+                """在 0 轴交叉处切开，返回 [(unit, pts)]，pts 为 (x,y,val,hm)。"""
+                raw = []
+                for t, v in seg:
+                    x = ypos.get(t)
+                    if x is None:
+                        continue
+                    raw.append((x, Y(v), v, t))
+                if not raw:
+                    return []
+                chunks = []
+                cur = [raw[0]]
+                for i in range(1, len(raw)):
+                    x0_, y0_, v0, t0 = raw[i - 1]
+                    x1_, y1_, v1, t1 = raw[i]
+                    if v0 == 0 or v1 == 0 or (v0 > 0) == (v1 > 0):
+                        cur.append(raw[i])
+                        continue
+                    # 线性插值过零
+                    if v1 != v0:
+                        r = (0 - v0) / (v1 - v0)
+                        xz = x0_ + (x1_ - x0_) * r
+                        yz = Y(0.0)
+                        cur.append((xz, yz, 0.0, t0))
+                        chunks.append(cur)
+                        cur = [(xz, yz, 0.0, t1), raw[i]]
+                    else:
+                        cur.append(raw[i])
+                if cur:
+                    chunks.append(cur)
+                return chunks
+
+            for seg in segs:
+                for chunk in _split_zero(seg):
+                    if len(chunk) < 2:
+                        if chunk:
+                            x, y, v, t = chunk[0]
+                            col = self.fg_up if v >= 0 else self.fg_dn
+                            canvas.create_oval(x - 1.5, y - 1.5, x + 1.5, y + 1.5, fill=col, outline="")
+                            state["drawn"].append((x, y, t, v))
+                        continue
+                    xs_ys = []
+                    for x, y, v, t in chunk:
+                        xs_ys.extend([x, y])
+                        state["drawn"].append((x, y, t, v))
+                    col = self.fg_up if chunk[1][2] > 0 or (chunk[1][2] == 0 and chunk[0][2] >= 0 and chunk[-1][2] >= 0) else self.fg_dn
+                    # 用多数符号着色
+                    mid_v = chunk[len(chunk) // 2][2]
+                    if mid_v == 0:
+                        mid_v = chunk[-1][2]
+                    col = self.fg_up if mid_v >= 0 else self.fg_dn
+                    poly = [chunk[0][0], zero_y]
+                    for x, y, v, t in chunk:
+                        poly += [x, y]
+                    poly += [chunk[-1][0], zero_y]
+                    fill = "#3a2222" if col == self.fg_up else "#1e2e24"
+                    canvas.create_polygon(poly, fill=fill, outline="")
+                    canvas.create_line(*xs_ys, fill=col, width=1.6, smooth=False)
+
+            # 最新点
+            last_pt = None
+            for t, v in reversed(points):
+                if v is not None and t in ypos:
+                    last_pt = (ypos[t], Y(v), t, v)
+                    break
+            if last_pt:
+                x, y, t, v = last_pt
+                col = self.fg_up if v >= 0 else self.fg_dn
+                canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill=col, outline="")
+
+            # 悬停十字
+            hover = state.get("hover")
+            if hover and hover[0] in ypos and hover[1] is not None:
+                hx, hy = ypos[hover[0]], Y(hover[1])
+                canvas.create_line(hx, y0, hx, y1, fill="#666666", dash=(2, 2))
+                canvas.create_line(x0, hy, x1, hy, fill="#666666", dash=(2, 2))
+
+        def _on_move(e) -> None:
+            drawn = state.get("drawn") or []
+            if not drawn:
+                return
+            best = None
+            best_d = 14
+            for x, y, t, v in drawn:
+                d = abs(x - e.x)
+                if d < best_d:
+                    best_d = d
+                    best = (t, v)
+            if best != state.get("hover"):
+                state["hover"] = best
+                _draw()
+
+        def _on_leave(_e) -> None:
+            if state.get("hover") is not None:
+                state["hover"] = None
+                _draw()
+
+        canvas.bind("<Motion>", _on_move)
+        canvas.bind("<Leave>", _on_leave)
+        canvas.bind("<Configure>", lambda _e: _draw())
+
+        def _schedule() -> None:
+            job = state.get("job")
+            if job is not None:
+                try:
+                    win.after_cancel(job)
+                except Exception:
+                    pass
+            # 开盘约 30 秒刷新一次
+            delay = 30000 if is_market_open() else 180000
+            state["job"] = win.after(delay, lambda: self._curve_reload(force=False))
+
+        self._curve_paint_tabs = _paint_tabs
+        self._curve_draw = _draw
+        self._curve_header = head
+        self._curve_schedule = _schedule
+        self._curve_select = _select
+
+        win.update_idletasks()
+        need_w, need_h = 640, 380
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        x, y = (sw - need_w) // 2, (sh - need_h) // 2
+        x = max(8, min(x, sw - need_w - 8))
+        y = max(8, min(y, sh - need_h - 8))
+        win.geometry(f"{need_w}x{need_h}+{x}+{y}")
+        win.deiconify()
+        win.lift()
+        self._curve_reload(force=False)
+
+    def _curve_reload(self, force: bool = False) -> None:
+        win = getattr(self, "_curve_win", None)
+        state = getattr(self, "_curve_state", None)
+        if win is None or state is None:
+            return
+        try:
+            if not win.winfo_exists():
+                return
+        except Exception:
+            return
+        if state.get("loading"):
+            return
+        state["loading"] = True
+        if force:
+            _invalidate_trend_cache()
+        head = getattr(self, "_curve_header", None)
+        if head is not None:
+            try:
+                head.config(text="加载中…")
+            except Exception:
+                pass
+
+        def work() -> None:
+            try:
+                tabs = self._build_today_curves()
+            except Exception:
+                tabs = []
+            def apply() -> None:
+                state["loading"] = False
+                try:
+                    if not win.winfo_exists():
+                        return
+                except Exception:
+                    return
+                prev = state.get("current") or ""
+                state["tabs"] = tabs
+                keys = [t["key"] for t in tabs]
+                if prev in keys:
+                    state["current"] = prev
+                elif tabs:
+                    state["current"] = tabs[0]["key"]
+                else:
+                    state["current"] = ""
+                state["hover"] = None
+                try:
+                    self._curve_paint_tabs()
+                    self._curve_draw()
+                    self._curve_schedule()
+                except Exception:
+                    pass
+            self.root.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _build_today_curves(self) -> List[dict]:
+        with self._lock:
+            items = [dict(x) for x in self._items]
+            states = {c: dict(s) for c, s in self._fund_state.items()}
+            stock_keys = dict(self._stock_keys)
+
+        secids: List[str] = ["1.000001", "124.HSTECH"]
+        fund_meta: List[dict] = []
+        for it in items:
+            code = it["code"]
+            if it.get("kind") == "stock":
+                sk = stock_keys.get(code) or ""
+                sid = _secid_from_sina_key(sk) if sk else None
+                if not sid:
+                    # 兜底：按代码猜市场
+                    raw = str(code)
+                    if len(re.sub(r"\D", "", raw)) == 5 or raw.upper().startswith("HK"):
+                        sid = _em_secid("hk", raw)
+                    else:
+                        sid = _secid_from_sina_key((sina_keys_for_stock(raw) or [""])[0])
+                if sid:
+                    secids.append(sid)
+                    it["_sid"] = sid
+            else:
+                st = states.get(code) or {}
+                holdings = list(st.get("holdings") or [])
+                hk = fund_is_hk_heavy(
+                    holdings,
+                    fund=st.get("fund"),
+                    label=str(it.get("label") or ""),
+                )
+                for market, c, _n, _w in holdings:
+                    sid = _em_secid(market, c)
+                    if sid:
+                        secids.append(sid)
+                fund_meta.append({"item": it, "holdings": holdings, "hk": hk})
+
+        trends = fetch_minute_trends(secids)
+        cap = _curve_cap_hm(trends)
+
+        tabs: List[dict] = []
+        mix_axis = SESSION_AXES["mix"]
+        cn_axis = SESSION_AXES["cn"]
+        hk_axis = SESSION_AXES["hk"]
+
+        fund_curves_mix: Dict[str, List[Tuple[str, Optional[float]]]] = {}
+        fund_curves_own: Dict[str, dict] = {}
+        for meta in fund_meta:
+            it = meta["item"]
+            code = it["code"]
+            axis_kind = "hk" if meta["hk"] else "cn"
+            axis = hk_axis if meta["hk"] else cn_axis
+            own = _clip_curve(_fund_curve(meta["holdings"], trends, axis), cap)
+            mix = _clip_curve(_fund_curve(meta["holdings"], trends, mix_axis), cap)
+            fund_curves_mix[code] = mix
+            fund_curves_own[code] = {"axis": axis_kind, "points": own, "label": it.get("label") or code}
+
+        stock_curves_mix: Dict[str, List[Tuple[str, Optional[float]]]] = {}
+        stock_own: List[dict] = []
+        for it in items:
+            if it.get("kind") != "stock":
+                continue
+            sid = it.get("_sid")
+            tr = trends.get(sid) if sid else None
+            # 判断港股还是 A 股
+            sk = stock_keys.get(it["code"]) or ""
+            is_hk = "hk" in sk.lower() or (sid or "").startswith("116.")
+            axis_kind = "hk" if is_hk else "cn"
+            axis = hk_axis if is_hk else cn_axis
+            own = _clip_curve(_align_pct(tr, axis) if tr else [(t, None) for t in axis], cap)
+            mix = _clip_curve(_align_pct(tr, mix_axis) if tr else [(t, None) for t in mix_axis], cap)
+            stock_curves_mix[it["code"]] = mix
+            stock_own.append(
+                {
+                    "code": it["code"],
+                    "label": it.get("label") or it["code"],
+                    "axis": axis_kind,
+                    "points": own,
+                }
+            )
+
+        has_amount = any(float(it.get("amount") or 0) for it in items)
+        if has_amount:
+            tabs.append(
+                {
+                    "key": "total",
+                    "title": "合计",
+                    "unit": "pnl",
+                    "axis": "mix",
+                    "points": _clip_curve(
+                        _total_pnl_curve(items, fund_curves_mix, stock_curves_mix, mix_axis), cap
+                    ),
+                }
+            )
+
+        sh_tr = trends.get("1.000001")
+        tabs.append(
+            {
+                "key": "sh",
+                "title": "上证",
+                "unit": "pct",
+                "axis": "cn",
+                "points": _clip_curve(
+                    _align_pct(sh_tr, cn_axis) if sh_tr else [(t, None) for t in cn_axis], cap
+                ),
+            }
+        )
+        hk_tr = trends.get("124.HSTECH")
+        tabs.append(
+            {
+                "key": "hstech",
+                "title": "恒科",
+                "unit": "pct",
+                "axis": "hk",
+                "points": _clip_curve(
+                    _align_pct(hk_tr, hk_axis) if hk_tr else [(t, None) for t in hk_axis], cap
+                ),
+            }
+        )
+        for code, info in fund_curves_own.items():
+            tabs.append(
+                {
+                    "key": f"fund:{code}",
+                    "title": str(info["label"]),
+                    "unit": "pct",
+                    "axis": info["axis"],
+                    "points": info["points"],
+                }
+            )
+        for info in stock_own:
+            tabs.append(
+                {
+                    "key": f"stock:{info['code']}",
+                    "title": str(info["label"]),
+                    "unit": "pct",
+                    "axis": info["axis"],
+                    "points": info["points"],
+                }
+            )
+        return tabs
+
 
     def _show_fund_detail(self) -> None:
         """右键：各基金持仓贡献明细（后台拉行情，防闪）。"""
