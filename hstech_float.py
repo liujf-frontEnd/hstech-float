@@ -273,7 +273,8 @@ def _http_get_curl(url: str, *, encoding: str, headers: dict) -> str:
     curl = shutil.which("curl.exe") or shutil.which("curl")
     if not curl:
         raise FileNotFoundError("curl not found")
-    cmd = [curl, "-sS", "-L", "--max-time", "10", "--connect-timeout", "8"]
+    # HTTP/2 + Schannel 在部分网络上会被对端直接掐断（curl 56 missing close_notify）
+    cmd = [curl, "-sS", "-L", "--http1.1", "--no-keepalive", "--max-time", "10", "--connect-timeout", "8"]
     for k, v in headers.items():
         lk = k.lower()
         if lk == "user-agent":
@@ -293,7 +294,10 @@ def _http_get_curl(url: str, *, encoding: str, headers: dict) -> str:
     if p.returncode != 0:
         err = (p.stderr or b"").decode("utf-8", errors="replace").strip()[:240]
         raise OSError(f"curl exit {p.returncode}: {err or 'no stderr'}")
-    return (p.stdout or b"").decode(encoding, errors="replace")
+    raw = p.stdout or b""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    return raw.decode(encoding, errors="replace")
 
 
 def _sina_batch(codes: List[str]) -> Dict[str, List[str]]:
@@ -877,9 +881,20 @@ SESSION_AXES: Dict[str, List[str]] = {
 }
 
 
-_trend_cache: Dict[str, Tuple[float, Optional[dict]]] = {}
+_trend_cache: Dict[str, Tuple[float, str, Optional[dict]]] = {}
 _trend_cache_lock = threading.Lock()
-_TREND_TTL = 20.0
+_trend_inflight: Dict[str, "_TrendWait"] = {}
+_TREND_OK_TTL = 45.0
+_TREND_FAIL_TTL = 2.0
+_FUND_CURVE_MAX_HOLDINGS = 12
+_FUND_CURVE_COVER_TARGET = 0.85
+_FUND_CURVE_MIN_COVER = 0.75
+
+
+class _TrendWait:
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.value: Optional[dict] = None
 
 
 def _invalidate_trend_cache() -> None:
@@ -908,59 +923,199 @@ def _clip_curve(
     return [(t, v if t <= cap_hm else None) for t, v in points]
 
 
-def fetch_minute_trend(secid: str) -> Optional[dict]:
-    """东财分时。返回 {name, pre, points: [(HH:MM, price), ...]}。"""
-    now_ts = time.time()
-    with _trend_cache_lock:
-        hit = _trend_cache.get(secid)
-    if hit and now_ts - hit[0] < _TREND_TTL:
-        return hit[1]
+def _tencent_code_from_secid(secid: str) -> Optional[str]:
+    s = (secid or "").strip()
+    if "." not in s:
+        return None
+    market, code = s.split(".", 1)
+    code = (code or "").strip()
+    if market == "1" and code:
+        return "sh" + code
+    if market == "0" and code:
+        return "sz" + code
+    if market in ("116", "124") and code:
+        return "hk" + code
+    return None
+
+
+def _qt_row(qt: dict, code: str) -> list:
+    row = qt.get(code)
+    if isinstance(row, list) and len(row) >= 5:
+        return row
+    for v in qt.values():
+        if isinstance(v, list) and len(v) >= 5:
+            return v
+    return []
+
+
+def _parse_hm_token(token: str) -> Optional[str]:
+    t = (token or "").strip()
+    if len(t) == 4 and t.isdigit():
+        return t[:2] + ":" + t[2:]
+    if len(t) >= 5 and t[2] == ":":
+        return t[:5]
+    return None
+
+
+def _fetch_tencent_trend(secid: str) -> Optional[dict]:
+    """腾讯分时。用户电脑上东财 push2 经常被掐断，这条更稳。"""
+    code = _tencent_code_from_secid(secid)
+    if not code:
+        return None
+    url = "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=" + code
+    text = _http_get(url, extra_headers={"Referer": "https://gu.qq.com/"})
+    js = json.loads(text) if text else {}
+    if (js or {}).get("code") not in (0, "0"):
+        return None
+    payload = ((js or {}).get("data") or {}).get(code) or {}
+    if not isinstance(payload, dict):
+        return None
+    inner = payload.get("data") or {}
+    if not isinstance(inner, dict):
+        return None
+    day = str(inner.get("date") or "").replace("-", "")
+    today_compact = _trade_date_str().replace("-", "")
+    if day != today_compact:
+        return None
+    qt = payload.get("qt") or {}
+    if not isinstance(qt, dict):
+        return None
+    row = _qt_row(qt, code)
+    if len(row) < 5:
+        return None
+    got = str(row[2] or "").upper()
+    want = code[2:].upper() if code[:2].lower() in ("sh", "sz", "hk") else code.upper()
+    if got and want and got != want:
+        return None
+    try:
+        pre = float(row[4])
+    except Exception:
+        return None
+    if pre <= 0:
+        return None
+    points: List[Tuple[str, float]] = []
+    for raw in inner.get("data") or []:
+        try:
+            parts = str(raw).split()
+            if len(parts) < 2:
+                continue
+            hm = _parse_hm_token(parts[0])
+            if not hm:
+                continue
+            price = float(parts[1])
+            if price <= 0:
+                continue
+            points.append((hm, price))
+        except Exception:
+            continue
+    if not points:
+        return None
+    return {
+        "secid": secid,
+        "name": str(row[1] or ""),
+        "pre": pre,
+        "points": points,
+        "date": _trade_date_str(),
+        "source": "tencent",
+    }
+
+
+def _fetch_eastmoney_trend(secid: str) -> Optional[dict]:
+    """东财 trends2 兜底。校验 secid / 当日日期 / preClose，错日或错品种直接丢弃。"""
     url = (
         "https://push2.eastmoney.com/api/qt/stock/trends2/get"
         f"?secid={secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13"
         "&fields2=f51,f52,f53,f54,f55,f56,f57,f58&ndays=1&iscr=0"
     )
-    data: dict = {}
-    try:
-        text = _http_get(url, extra_headers={"Referer": "https://quote.eastmoney.com/"})
-        data = (json.loads(text) or {}).get("data") or {}
-    except Exception:
-        data = {}
+    text = _http_get(url, extra_headers={"Referer": "https://quote.eastmoney.com/"})
+    data = (json.loads(text) or {}).get("data") or {} if text else {}
     if not data:
-        with _trend_cache_lock:
-            _trend_cache[secid] = (now_ts, None)
+        return None
+    got_code = str(data.get("code") or "").upper()
+    got_mkt = str(data.get("market") or "")
+    want_mkt, _, want_code = secid.partition(".")
+    if got_code != want_code.upper() or got_mkt != want_mkt:
         return None
     try:
         pre = float(data.get("preClose") or data.get("prePrice") or 0)
     except Exception:
         pre = 0.0
+    if pre <= 0:
+        return None
     today = _trade_date_str()
     points: List[Tuple[str, float]] = []
     for raw in data.get("trends") or []:
         try:
             head, *rest = str(raw).split(",")
             parts = head.strip().split(" ", 1)
-            if len(parts) != 2:
+            if len(parts) != 2 or len(rest) < 2:
                 continue
             day, hm = parts
             if day != today:
                 continue
             hm = hm[:5]
-            price = float(rest[1])  # 该分钟收
+            price = float(rest[1])
             if price <= 0:
                 continue
             points.append((hm, price))
         except Exception:
             continue
-    out = {
+    if not points:
+        return None
+    return {
         "secid": secid,
         "name": str(data.get("name") or ""),
         "pre": pre,
         "points": points,
+        "date": today,
+        "source": "eastmoney",
     }
+
+
+def _fetch_minute_trend_uncached(secid: str) -> Optional[dict]:
+    for fn in (_fetch_tencent_trend, _fetch_eastmoney_trend):
+        try:
+            out = fn(secid)
+        except Exception:
+            out = None
+        if out and out.get("points") and float(out.get("pre") or 0) > 0:
+            return out
+    return None
+
+
+def fetch_minute_trend(secid: str) -> Optional[dict]:
+    """分时。返回 {name, pre, points: [(HH:MM, price), ...]}；失败不长期缓存。"""
+    if not secid:
+        return None
+    now_ts = time.time()
+    today = _trade_date_str()
     with _trend_cache_lock:
-        _trend_cache[secid] = (now_ts, out)
-    return out
+        hit = _trend_cache.get(secid)
+        if hit and hit[1] == today:
+            ts, _day, val = hit
+            ttl = _TREND_OK_TTL if val else _TREND_FAIL_TTL
+            if now_ts - ts < ttl:
+                return val
+        waiter = _trend_inflight.get(secid)
+        mine = False
+        if waiter is None:
+            waiter = _TrendWait()
+            _trend_inflight[secid] = waiter
+            mine = True
+    if not mine:
+        waiter.event.wait(25)
+        return waiter.value
+    try:
+        out = _fetch_minute_trend_uncached(secid)
+        waiter.value = out
+        with _trend_cache_lock:
+            _trend_cache[secid] = (time.time(), today, out)
+        return out
+    finally:
+        waiter.event.set()
+        with _trend_cache_lock:
+            if _trend_inflight.get(secid) is waiter:
+                del _trend_inflight[secid]
 
 
 def fetch_minute_trends(secids: List[str]) -> Dict[str, dict]:
@@ -973,7 +1128,7 @@ def fetch_minute_trends(secids: List[str]) -> Dict[str, dict]:
     out: Dict[str, dict] = {}
     if not uniq:
         return out
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         futs = {ex.submit(fetch_minute_trend, s): s for s in uniq}
         for fut in as_completed(futs):
             s = futs[fut]
@@ -981,7 +1136,7 @@ def fetch_minute_trends(secids: List[str]) -> Dict[str, dict]:
                 tr = fut.result()
             except Exception:
                 tr = None
-            if tr:
+            if tr and tr.get("points") and float(tr.get("pre") or 0) > 0:
                 out[s] = tr
     return out
 
@@ -1011,6 +1166,41 @@ def _align_pct(trend: dict, axis: List[str]) -> List[Tuple[str, Optional[float]]
     return [(hm, _lookup_last(pts, hm)) for hm in axis]
 
 
+def _select_curve_holdings(holdings: List[Holding]) -> List[Holding]:
+    """曲线只用少量权重大的持仓，避免一次请求几十上百个东财/腾讯分时。"""
+    ranked: List[Tuple[float, Holding]] = []
+    total = 0.0
+    for h in holdings or []:
+        try:
+            w = float(h[3])
+        except Exception:
+            continue
+        if w <= 0:
+            continue
+        ranked.append((w, h))
+        total += w
+    if not ranked or total <= 0:
+        return []
+    ranked.sort(key=lambda x: -x[0])
+    top_w, top_h = ranked[0]
+    if top_w >= 80.0 or top_w / total >= 0.80:
+        return [top_h]
+    picked: List[Holding] = []
+    acc = 0.0
+    for w, h in ranked:
+        if len(picked) >= _FUND_CURVE_MAX_HOLDINGS:
+            break
+        picked.append(h)
+        acc += w
+        if acc / total >= _FUND_CURVE_COVER_TARGET and len(picked) >= 4:
+            break
+    return picked
+
+
+def _curve_has_values(points: List[Tuple[str, Optional[float]]]) -> bool:
+    return any(v is not None for _, v in (points or []))
+
+
 def _fund_curve(
     holdings: List[Holding],
     trends: Dict[str, dict],
@@ -1018,6 +1208,8 @@ def _fund_curve(
 ) -> List[Tuple[str, Optional[float]]]:
     series: List[List[Tuple[str, float]]] = []
     weights: List[float] = []
+    total_w = 0.0
+    used_w = 0.0
     for market, code, _n, w in holdings:
         try:
             wf = float(w)
@@ -1025,6 +1217,7 @@ def _fund_curve(
             continue
         if wf <= 0:
             continue
+        total_w += wf
         sid = _em_secid(market, code)
         if not sid:
             continue
@@ -1036,6 +1229,9 @@ def _fund_curve(
             continue
         series.append(pts)
         weights.append(wf)
+        used_w += wf
+    if total_w <= 0 or used_w / total_w < _FUND_CURVE_MIN_COVER:
+        return [(hm, None) for hm in axis]
     out: List[Tuple[str, Optional[float]]] = []
     for hm in axis:
         est = 0.0
@@ -1056,6 +1252,18 @@ def _total_pnl_curve(
     stock_curves: Dict[str, List[Tuple[str, Optional[float]]]],
     axis: List[str],
 ) -> List[Tuple[str, Optional[float]]]:
+    # 任一有金额的品种曲线缺失时，宁可不画合计，避免残缺加权画出错误盈亏。
+    for it in items:
+        try:
+            amt = float(it.get("amount") or 0)
+        except Exception:
+            amt = 0.0
+        if amt == 0:
+            continue
+        code = it.get("code") or ""
+        cur = (stock_curves if it.get("kind") == "stock" else fund_curves).get(code) or []
+        if not _curve_has_values(cur):
+            return [(hm, None) for hm in axis]
     out: List[Tuple[str, Optional[float]]] = []
     for i, hm in enumerate(axis):
         total = 0.0
@@ -3096,11 +3304,12 @@ class FloatWidget:
                     fund=st.get("fund"),
                     label=str(it.get("label") or ""),
                 )
-                for market, c, _n, _w in holdings:
+                curve_hs = _select_curve_holdings(holdings)
+                for market, c, _n, _w in curve_hs:
                     sid = _em_secid(market, c)
                     if sid:
                         secids.append(sid)
-                fund_meta.append({"item": it, "holdings": holdings, "hk": hk})
+                fund_meta.append({"item": it, "holdings": curve_hs, "hk": hk})
 
         trends = fetch_minute_trends(secids)
         cap = _curve_cap_hm(trends)
