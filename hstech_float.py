@@ -886,8 +886,6 @@ _trend_cache_lock = threading.Lock()
 _trend_inflight: Dict[str, "_TrendWait"] = {}
 _TREND_OK_TTL = 45.0
 _TREND_FAIL_TTL = 2.0
-_FUND_CURVE_MAX_HOLDINGS = 12
-_FUND_CURVE_COVER_TARGET = 0.85
 _FUND_CURVE_MIN_COVER = 0.75
 
 
@@ -1166,39 +1164,140 @@ def _align_pct(trend: dict, axis: List[str]) -> List[Tuple[str, Optional[float]]
     return [(hm, _lookup_last(pts, hm)) for hm in axis]
 
 
-def _select_curve_holdings(holdings: List[Holding]) -> List[Holding]:
-    """曲线只用少量权重大的持仓，避免一次请求几十上百个东财/腾讯分时。"""
-    ranked: List[Tuple[float, Holding]] = []
-    total = 0.0
-    for h in holdings or []:
-        try:
-            w = float(h[3])
-        except Exception:
-            continue
-        if w <= 0:
-            continue
-        ranked.append((w, h))
-        total += w
-    if not ranked or total <= 0:
-        return []
-    ranked.sort(key=lambda x: -x[0])
-    top_w, top_h = ranked[0]
-    if top_w >= 80.0 or top_w / total >= 0.80:
-        return [top_h]
-    picked: List[Holding] = []
-    acc = 0.0
-    for w, h in ranked:
-        if len(picked) >= _FUND_CURVE_MAX_HOLDINGS:
-            break
-        picked.append(h)
-        acc += w
-        if acc / total >= _FUND_CURVE_COVER_TARGET and len(picked) >= 4:
-            break
-    return picked
-
-
 def _curve_has_values(points: List[Tuple[str, Optional[float]]]) -> bool:
     return any(v is not None for _, v in (points or []))
+
+
+def _session_hm_now(axis_kind: str = "mix") -> str:
+    """当前时刻落在该交易轴上的最后一个时间格（未开盘则为轴首）。"""
+    now = now_shanghai().strftime("%H:%M")
+    axis = SESSION_AXES.get(axis_kind) or SESSION_AXES["mix"]
+    last = axis[0] if axis else now
+    for t in axis:
+        if t <= now:
+            last = t
+        else:
+            break
+    return last
+
+
+def _anchor_curve_last(
+    points: List[Tuple[str, Optional[float]]],
+    live: Optional[float],
+    hm: str,
+) -> List[Tuple[str, Optional[float]]]:
+    """把可见末点改成与主浮窗相同的实时估值，标题「现」随之对齐。"""
+    if live is None or not points:
+        return points
+    out = list(points)
+    idx = None
+    for i, (t, _v) in enumerate(out):
+        if t <= hm:
+            idx = i
+        else:
+            break
+    if idx is None:
+        return out
+    t, _ = out[idx]
+    out[idx] = (t, float(live))
+    return out
+
+
+def book_from_snap(items: List[dict], snap: Optional[dict]) -> dict:
+    """与主浮窗合计同一口径：全持仓估值 × 本金。"""
+    snap = snap or {}
+    funds = snap.get("funds") or {}
+    stocks = snap.get("stocks") or {}
+    fund_pct: Dict[str, float] = {}
+    stock_pct: Dict[str, float] = {}
+    total_pnl = 0.0
+    has_total = False
+    for it in items or []:
+        code = str(it.get("code") or "")
+        try:
+            amt = float(it.get("amount") or 0.0)
+        except Exception:
+            amt = 0.0
+        if it.get("kind") == "stock":
+            ss = stocks.get(code) or {}
+            if "pct" not in ss:
+                continue
+            try:
+                pct = float(ss.get("pct") or 0.0)
+            except Exception:
+                continue
+            stock_pct[code] = pct
+            if amt > 0:
+                total_pnl += amt * pct / 100.0
+                has_total = True
+        else:
+            fs = funds.get(code) or {}
+            if "est_pct" not in fs:
+                continue
+            try:
+                pct = float(fs.get("est_pct") or 0.0)
+            except Exception:
+                continue
+            fund_pct[code] = pct
+            if amt > 0:
+                total_pnl += amt * pct / 100.0
+                has_total = True
+    sh_pct = hk_pct = None
+    try:
+        sh_pct = float(snap["sh"][2])  # type: ignore[index]
+    except Exception:
+        sh_pct = None
+    try:
+        hk_pct = float(snap["hstech"][2])  # type: ignore[index]
+    except Exception:
+        hk_pct = None
+    return {
+        "total_pnl": total_pnl if has_total else None,
+        "fund_pct": fund_pct,
+        "stock_pct": stock_pct,
+        "sh_pct": sh_pct,
+        "hstech_pct": hk_pct,
+    }
+
+
+def live_map_from_book(book: dict) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    if not book:
+        return out
+    if book.get("total_pnl") is not None:
+        out["total"] = float(book["total_pnl"])
+    if book.get("sh_pct") is not None:
+        out["sh"] = float(book["sh_pct"])
+    if book.get("hstech_pct") is not None:
+        out["hstech"] = float(book["hstech_pct"])
+    for code, pct in (book.get("fund_pct") or {}).items():
+        out[f"fund:{code}"] = float(pct)
+    for code, pct in (book.get("stock_pct") or {}).items():
+        out[f"stock:{code}"] = float(pct)
+    return out
+
+
+def apply_live_to_tabs(tabs: List[dict], live_map: Dict[str, float]) -> List[dict]:
+    if not tabs or not live_map:
+        return tabs
+    now_by = {
+        "cn": _session_hm_now("cn"),
+        "hk": _session_hm_now("hk"),
+        "mix": _session_hm_now("mix"),
+    }
+    out = []
+    for tab in tabs:
+        t = dict(tab)
+        key = t.get("key")
+        if key in live_map and _curve_has_values(t.get("points") or []):
+            kind = t.get("axis") or "cn"
+            t["points"] = _anchor_curve_last(
+                list(t.get("points") or []),
+                live_map[key],
+                now_by.get(kind) or _session_hm_now(kind),
+            )
+        out.append(t)
+    return out
 
 
 def _fund_curve(
@@ -2776,6 +2875,11 @@ class FloatWidget:
         except KeyError:
             pass
 
+        try:
+            self._curve_sync_live()
+        except Exception:
+            pass
+
         if self._hidden:
             self.root.after_idle(self._fit_mini)
         else:
@@ -3304,12 +3408,11 @@ class FloatWidget:
                     fund=st.get("fund"),
                     label=str(it.get("label") or ""),
                 )
-                curve_hs = _select_curve_holdings(holdings)
-                for market, c, _n, _w in curve_hs:
+                for market, c, _n, _w in holdings:
                     sid = _em_secid(market, c)
                     if sid:
                         secids.append(sid)
-                fund_meta.append({"item": it, "holdings": curve_hs, "hk": hk})
+                fund_meta.append({"item": it, "holdings": holdings, "hk": hk})
 
         trends = fetch_minute_trends(secids)
         cap = _curve_cap_hm(trends)
@@ -3413,8 +3516,46 @@ class FloatWidget:
                     "points": info["points"],
                 }
             )
+        # 末点对齐主浮窗当前估值（全持仓、新浪实时），避免分时源/截断分钟造成「现」对不上。
+        with self._lock:
+            snap = dict(self._snap) if self._snap else {}
+        tabs = apply_live_to_tabs(tabs, live_map_from_book(book_from_snap(items, snap)))
         return tabs
 
+
+    def _curve_sync_live(self) -> None:
+        """曲线窗口打开时，用主浮窗最新快照刷新末点和标题数字。"""
+        win = getattr(self, "_curve_win", None)
+        state = getattr(self, "_curve_state", None)
+        if win is None or state is None or state.get("loading"):
+            return
+        try:
+            if not win.winfo_exists():
+                return
+        except Exception:
+            return
+        tabs = state.get("tabs") or []
+        if not tabs:
+            return
+        with self._lock:
+            items = [dict(x) for x in self._items]
+            snap = dict(self._snap) if self._snap else {}
+        new_tabs = apply_live_to_tabs(tabs, live_map_from_book(book_from_snap(items, snap)))
+        if new_tabs is tabs:
+            return
+        # 仅当末点变化时重绘，避免无意义刷新
+        changed = False
+        for a, b in zip(tabs, new_tabs):
+            if (a.get("points") or []) != (b.get("points") or []):
+                changed = True
+                break
+        if not changed:
+            return
+        state["tabs"] = new_tabs
+        try:
+            self._curve_draw()
+        except Exception:
+            pass
 
     def _show_fund_detail(self) -> None:
         """右键：各基金持仓贡献明细（后台拉行情，防闪）。"""
