@@ -886,7 +886,6 @@ _trend_cache_lock = threading.Lock()
 _trend_inflight: Dict[str, "_TrendWait"] = {}
 _TREND_OK_TTL = 45.0
 _TREND_FAIL_TTL = 2.0
-_FUND_CURVE_MIN_COVER = 0.75
 
 
 class _TrendWait:
@@ -955,13 +954,26 @@ def _parse_hm_token(token: str) -> Optional[str]:
     return None
 
 
-def _fetch_tencent_trend(secid: str) -> Optional[dict]:
-    """腾讯分时。用户电脑上东财 push2 经常被掐断，这条更稳。"""
-    code = _tencent_code_from_secid(secid)
-    if not code:
-        return None
-    url = "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=" + code
-    text = _http_get(url, extra_headers={"Referer": "https://gu.qq.com/"})
+def _http_get_once(url: str, *, extra_headers: Optional[dict] = None, timeout: float = 6.0) -> str:
+    """单次 urllib 请求，不用全局重试/curl，避免分时批量时被东财兜底拖垮。"""
+    headers = {"User-Agent": UA, "Accept": "*/*"}
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as resp:
+        raw = resp.read()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    return raw.decode("utf-8", errors="replace")
+
+
+_TENCENT_MINUTE_URLS = (
+    "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/minute/query?code=",
+    "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=",
+)
+
+
+def _parse_tencent_trend(secid: str, code: str, text: str) -> Optional[dict]:
     js = json.loads(text) if text else {}
     if (js or {}).get("code") not in (0, "0"):
         return None
@@ -1018,6 +1030,23 @@ def _fetch_tencent_trend(secid: str) -> Optional[dict]:
     }
 
 
+def _fetch_tencent_trend(secid: str) -> Optional[dict]:
+    """腾讯分时。优先走 QQ 财经反代（直连 ifzq 易被拦下返回 501）。"""
+    code = _tencent_code_from_secid(secid)
+    if not code:
+        return None
+    headers = {"Referer": "https://gu.qq.com/"}
+    for base in _TENCENT_MINUTE_URLS:
+        try:
+            text = _http_get_once(base + code, extra_headers=headers)
+            out = _parse_tencent_trend(secid, code, text)
+        except Exception:
+            out = None
+        if out and out.get("points") and float(out.get("pre") or 0) > 0:
+            return out
+    return None
+
+
 def _fetch_eastmoney_trend(secid: str) -> Optional[dict]:
     """东财 trends2 兜底。校验 secid / 当日日期 / preClose，错日或错品种直接丢弃。"""
     url = (
@@ -1070,18 +1099,35 @@ def _fetch_eastmoney_trend(secid: str) -> Optional[dict]:
     }
 
 
-def _fetch_minute_trend_uncached(secid: str) -> Optional[dict]:
-    for fn in (_fetch_tencent_trend, _fetch_eastmoney_trend):
+def _trend_ok(out: Optional[dict]) -> bool:
+    try:
+        return bool(out and out.get("points") and float(out.get("pre") or 0) > 0)
+    except Exception:
+        return False
+
+
+def _fetch_minute_trend_uncached(secid: str, *, allow_eastmoney: bool = False) -> Optional[dict]:
+    for attempt in range(2):
         try:
-            out = fn(secid)
+            out = _fetch_tencent_trend(secid)
         except Exception:
             out = None
-        if out and out.get("points") and float(out.get("pre") or 0) > 0:
+        if _trend_ok(out):
+            return out
+        time.sleep(0.15 * (attempt + 1))
+    if allow_eastmoney:
+        try:
+            out = _fetch_eastmoney_trend(secid)
+        except Exception:
+            out = None
+        if _trend_ok(out):
             return out
     return None
 
 
-def fetch_minute_trend(secid: str) -> Optional[dict]:
+def fetch_minute_trend(
+    secid: str, *, force: bool = False, allow_eastmoney: bool = False
+) -> Optional[dict]:
     """分时。返回 {name, pre, points: [(HH:MM, price), ...]}；失败不长期缓存。"""
     if not secid:
         return None
@@ -1089,7 +1135,7 @@ def fetch_minute_trend(secid: str) -> Optional[dict]:
     today = _trade_date_str()
     with _trend_cache_lock:
         hit = _trend_cache.get(secid)
-        if hit and hit[1] == today:
+        if (not force) and hit and hit[1] == today:
             ts, _day, val = hit
             ttl = _TREND_OK_TTL if val else _TREND_FAIL_TTL
             if now_ts - ts < ttl:
@@ -1104,7 +1150,7 @@ def fetch_minute_trend(secid: str) -> Optional[dict]:
         waiter.event.wait(25)
         return waiter.value
     try:
-        out = _fetch_minute_trend_uncached(secid)
+        out = _fetch_minute_trend_uncached(secid, allow_eastmoney=allow_eastmoney)
         waiter.value = out
         with _trend_cache_lock:
             _trend_cache[secid] = (time.time(), today, out)
@@ -1114,6 +1160,28 @@ def fetch_minute_trend(secid: str) -> Optional[dict]:
         with _trend_cache_lock:
             if _trend_inflight.get(secid) is waiter:
                 del _trend_inflight[secid]
+
+
+def _run_trend_batch(
+    secids: List[str], *, workers: int, force: bool = False, allow_eastmoney: bool = False
+) -> Dict[str, dict]:
+    out: Dict[str, dict] = {}
+    if not secids:
+        return out
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        futs = {
+            ex.submit(fetch_minute_trend, s, force=force, allow_eastmoney=allow_eastmoney): s
+            for s in secids
+        }
+        for fut in as_completed(futs):
+            s = futs[fut]
+            try:
+                tr = fut.result()
+            except Exception:
+                tr = None
+            if _trend_ok(tr):
+                out[s] = tr
+    return out
 
 
 def fetch_minute_trends(secids: List[str]) -> Dict[str, dict]:
@@ -1126,16 +1194,19 @@ def fetch_minute_trends(secids: List[str]) -> Dict[str, dict]:
     out: Dict[str, dict] = {}
     if not uniq:
         return out
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        futs = {ex.submit(fetch_minute_trend, s): s for s in uniq}
-        for fut in as_completed(futs):
-            s = futs[fut]
-            try:
-                tr = fut.result()
-            except Exception:
-                tr = None
-            if tr and tr.get("points") and float(tr.get("pre") or 0) > 0:
-                out[s] = tr
+    priority = [s for s in uniq if s in ("1.000001", "124.HSTECH")]
+    rest = [s for s in uniq if s not in ("1.000001", "124.HSTECH")]
+    # 指数先拉，避免被上百个持仓请求挤掉
+    out.update(_run_trend_batch(priority, workers=2, force=False, allow_eastmoney=False))
+    out.update(_run_trend_batch(rest, workers=3, force=False, allow_eastmoney=False))
+    miss = [s for s in uniq if s not in out]
+    if miss:
+        time.sleep(0.25)
+        out.update(_run_trend_batch(miss, workers=2, force=True, allow_eastmoney=False))
+    still = [s for s in priority if s not in out]
+    if still:
+        time.sleep(0.2)
+        out.update(_run_trend_batch(still, workers=1, force=True, allow_eastmoney=True))
     return out
 
 
@@ -1289,10 +1360,14 @@ def apply_live_to_tabs(tabs: List[dict], live_map: Dict[str, float]) -> List[dic
     for tab in tabs:
         t = dict(tab)
         key = t.get("key")
-        if key in live_map and _curve_has_values(t.get("points") or []):
+        if key in live_map:
             kind = t.get("axis") or "cn"
+            pts = list(t.get("points") or [])
+            if not pts:
+                axis = SESSION_AXES.get(kind) or SESSION_AXES["mix"]
+                pts = [(hm, None) for hm in axis]
             t["points"] = _anchor_curve_last(
-                list(t.get("points") or []),
+                pts,
                 live_map[key],
                 now_by.get(kind) or _session_hm_now(kind),
             )
@@ -1329,7 +1404,7 @@ def _fund_curve(
         series.append(pts)
         weights.append(wf)
         used_w += wf
-    if total_w <= 0 or used_w / total_w < _FUND_CURVE_MIN_COVER:
+    if not series:
         return [(hm, None) for hm in axis]
     out: List[Tuple[str, Optional[float]]] = []
     for hm in axis:
@@ -1351,18 +1426,7 @@ def _total_pnl_curve(
     stock_curves: Dict[str, List[Tuple[str, Optional[float]]]],
     axis: List[str],
 ) -> List[Tuple[str, Optional[float]]]:
-    # 任一有金额的品种曲线缺失时，宁可不画合计，避免残缺加权画出错误盈亏。
-    for it in items:
-        try:
-            amt = float(it.get("amount") or 0)
-        except Exception:
-            amt = 0.0
-        if amt == 0:
-            continue
-        code = it.get("code") or ""
-        cur = (stock_curves if it.get("kind") == "stock" else fund_curves).get(code) or []
-        if not _curve_has_values(cur):
-            return [(hm, None) for hm in axis]
+    # 历史路径按已取到的品种合成（不把缺数当 0 补全）；末点由浮窗快照对齐，避免残缺合计冒充终值。
     out: List[Tuple[str, Optional[float]]] = []
     for i, hm in enumerate(axis):
         total = 0.0
